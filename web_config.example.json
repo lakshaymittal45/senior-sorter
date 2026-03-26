@@ -1,0 +1,22 @@
+{
+  "college_domains": ["pec.edu", "pec.edu.in"],
+  "oauth": {
+    "credentials_json": "client_secret.json",
+    "local_redirect_uri": "http://localhost:53682/"
+  },
+  "processing": {
+    "max_image_side": 1600,
+    "face_distance_threshold": 0.47,
+    "relaxed_face_distance_threshold": 0.52,
+    "min_relaxed_hits": 3,
+    "blur_tolerance": 60,
+    "process_extensions": ["jpg", "jpeg", "png", "webp", "heic", "heif", "nef"],
+    "workers": 1,
+    "sample_encoding_jitters": 2,
+    "candidate_encoding_jitters": 1,
+    "face_detector_model": "hog",
+    "min_partial_face_score": 0.45,
+    "enable_partial_face_mode": false,
+    "save_non_matches": false
+  }
+}

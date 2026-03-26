@@ -1,0 +1,36 @@
+{
+  "google": {
+    "credentials_json": "client_secret.json",
+    "token_json": "token.json"
+  },
+  "input": {
+    "drive_links_file": "drive_links.txt",
+    "sample_images_dir": "samples"
+  },
+  "output": {
+    "matches_dir": "output/senior_matches",
+    "non_matches_dir": "output/non_matches",
+    "save_non_matches": false
+  },
+  "processing": {
+    "max_image_side": 1600,
+    "face_distance_threshold": 0.47,
+    "relaxed_face_distance_threshold": 0.52,
+    "min_relaxed_hits": 3,
+    "blur_tolerance": 60,
+    "process_extensions": [
+      "jpg",
+      "jpeg",
+      "png",
+      "webp",
+      "heic",
+      "heif"
+    ],
+    "workers": 4,
+    "sample_encoding_jitters": 2,
+    "candidate_encoding_jitters": 1,
+    "face_detector_model": "hog",
+    "min_partial_face_score": 0.45,
+    "enable_partial_face_mode": false
+  }
+}

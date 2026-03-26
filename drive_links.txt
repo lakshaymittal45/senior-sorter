@@ -1,0 +1,4 @@
+# Paste one Google Drive file/folder link per line
+# Example:
+# https://drive.google.com/drive/folders/XXXXXXXXXXXXXXXXXXXXXXXXX
+# https://drive.google.com/file/d/XXXXXXXXXXXXXXXXXXXXXXXXX/view

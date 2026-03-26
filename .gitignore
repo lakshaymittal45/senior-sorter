@@ -1,0 +1,36 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Logs and temp
+*.log
+*.tmp
+*.temp
+
+# IDE/editor
+.vscode/
+.idea/
+
+# App output
+output/
+
+# OAuth and tokens (secrets)
+client_secret.json
+token.json
+token_web.json
+
+# OS files
+.DS_Store
+Thumbs.db
