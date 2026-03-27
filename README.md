@@ -1,3 +1,11 @@
+---
+title: Senior Photo Sorter
+emoji: 📸
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+pinned: false
+---
 # Senior Photo Extractor from Google Drive Links
 
 This project has two modes:
