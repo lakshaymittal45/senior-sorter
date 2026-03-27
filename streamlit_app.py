@@ -195,8 +195,9 @@ def login_with_google(root: Path, config: Dict) -> None:
     primary_domain = domains[0] if domains else None
 
     try:
-        flow = Flow.from_client_secrets_file(
-            str(credentials_json),
+        client_cfg = get_oauth_client_config(root, config)
+        flow = Flow.from_client_config(
+            client_cfg,
             scopes=SCOPES,
             redirect_uri=redirect_uri,
         )
@@ -248,8 +249,9 @@ def complete_google_login_from_callback(root: Path, config: Dict) -> None:
     redirect_uri = st.session_state.get("oauth_redirect_uri") or get_oauth_redirect_uri(config)
 
     try:
-        flow = Flow.from_client_secrets_file(
-            str(credentials_json),
+        client_cfg = get_oauth_client_config(root, config)
+        flow = Flow.from_client_config(
+            client_cfg,
             scopes=SCOPES,
             redirect_uri=redirect_uri,
         )
