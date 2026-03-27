@@ -263,19 +263,24 @@ def decode_image_bytes(raw: bytes) -> Optional[np.ndarray]:
     return None
 
 
-def download_drive_image(service, file_id: str) -> Optional[np.ndarray]:
+def download_drive_file_raw(service, file_id: str) -> Optional[bytes]:
     request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
     buffer = io.BytesIO()
     downloader = MediaIoBaseDownload(buffer, request)
-
     done = False
     try:
         while not done:
             _, done = downloader.next_chunk()
     except HttpError:
         return None
+    return buffer.getvalue()
 
-    return decode_image_bytes(buffer.getvalue())
+
+def download_drive_image(service, file_id: str) -> Optional[np.ndarray]:
+    raw = download_drive_file_raw(service, file_id)
+    if raw:
+        return decode_image_bytes(raw)
+    return None
 
 
 def load_image_cv(path: Path) -> Optional[np.ndarray]:

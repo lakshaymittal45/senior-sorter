@@ -445,7 +445,7 @@ def run_extraction(root: Path, config: Dict, links_text: str, uploaded_samples) 
     per_image_timeout = 10  # seconds — save to doubtful if takes longer
 
     import time as _time
-    from senior_sorter import download_drive_image, resize_if_needed, save_match_image, sanitize_filename
+    from senior_sorter import download_drive_image, download_drive_file_raw, resize_if_needed, save_match_image, sanitize_filename
 
     def _process_one(meta):
         try:
@@ -457,19 +457,17 @@ def run_extraction(root: Path, config: Dict, links_text: str, uploaded_samples) 
             return False, meta.get("name", "?"), 1.0
 
     def _save_doubtful(meta):
-        """Download image and save to doubtful folder."""
+        """Download raw image and save to doubtful folder without decoding."""
         try:
             file_id = meta["id"]
             file_name = meta.get("name", file_id)
-            img = download_drive_image(service, file_id)
-            if img is not None:
-                img = resize_if_needed(img, pconfig.max_image_side)
+            raw = download_drive_file_raw(service, file_id)
+            if raw is not None:
                 ext = Path(file_name).suffix.lower()
-                if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+                if ext not in {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}:
                     ext = ".jpg"
                 safe_name = sanitize_filename(Path(file_name).stem)
-                out_name = f"{safe_name}__{file_id}{ext}"
-                save_match_image(img, doubtful_dir / out_name)
+                (doubtful_dir / f"{safe_name}__{file_id}{ext}").write_bytes(raw)
         except Exception:
             pass
 
