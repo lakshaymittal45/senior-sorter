@@ -2,21 +2,46 @@
   "college_domains": ["pec.edu", "pec.edu.in"],
   "oauth": {
     "credentials_json": "client_secret.json",
-    "local_redirect_uri": "http://localhost:53682/"
+    "token_cache_json": "token_web.json",
+    "redirect_uri": "http://localhost:8501/",
+    "local_redirect_uri": "http://localhost:8501/"
   },
   "processing": {
-    "max_image_side": 1600,
-    "face_distance_threshold": 0.47,
-    "relaxed_face_distance_threshold": 0.52,
-    "min_relaxed_hits": 3,
-    "blur_tolerance": 60,
-    "process_extensions": ["jpg", "jpeg", "png", "webp", "heic", "heif", "nef"],
-    "workers": 1,
-    "sample_encoding_jitters": 2,
-    "candidate_encoding_jitters": 1,
+    "max_image_side": 800,
+
+    "face_distance_threshold": 0.50,
+    "relaxed_face_distance_threshold": 0.58,
+    "strong_match_distance": 0.45,
+    "min_strict_hits": 1,
+    "min_relaxed_hits": 2,
+    "mean_topk_margin": 0.025,
+    "center_distance_margin": 0.03,
+
+    "blur_tolerance": 30,
+    "min_candidate_face_area_ratio": 0.005,
+
     "face_detector_model": "hog",
-    "min_partial_face_score": 0.45,
-    "enable_partial_face_mode": false,
+    "sample_detector_model": "hog",
+    "face_upsample_times": 1,
+    "enable_detector_fallback": true,
+
+    "sample_encoding_jitters": 1,
+    "candidate_encoding_jitters": 1,
+    "sample_outlier_percentile": 90.0,
+    "min_sample_encodings": 2,
+
+    "enable_tiling": false,
+    "tile_size": 800,
+    "tile_overlap": 0.25,
+
+    "rotation_angles": "",
+
+    "enable_partial_face_mode": true,
+    "min_partial_face_score": 0.40,
+
+    "workers": 1,
+
+    "process_extensions": ["jpg", "jpeg", "png", "webp", "heic", "heif", "nef"],
     "save_non_matches": false
   }
 }

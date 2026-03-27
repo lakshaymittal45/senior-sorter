@@ -2,12 +2,13 @@
   "college_domains": ["pec.edu", "pec.edu.in"],
   "oauth": {
     "credentials_json": "client_secret.json",
-    "local_redirect_uri": "http://localhost:53682/"
+    // "local_redirect_uri" removed: no cloud/deployment support
   },
   "processing": {
     "max_image_side": 1600,
     "face_distance_threshold": 0.47,
     "relaxed_face_distance_threshold": 0.52,
+    "min_strict_hits": 2,
     "min_relaxed_hits": 3,
     "blur_tolerance": 60,
     "process_extensions": ["jpg", "jpeg", "png", "webp", "heic", "heif", "nef"],
@@ -15,6 +16,14 @@
     "sample_encoding_jitters": 2,
     "candidate_encoding_jitters": 1,
     "face_detector_model": "hog",
+    "face_upsample_times": 1,
+    "enable_detector_fallback": true,
+    "mean_topk_margin": 0.015,
+    "center_distance_margin": 0.02,
+    "strong_match_distance": 0.42,
+    "min_candidate_face_area_ratio": 0.01,
+    "sample_outlier_percentile": 85.0,
+    "min_sample_encodings": 4,
     "min_partial_face_score": 0.45,
     "enable_partial_face_mode": false,
     "save_non_matches": false

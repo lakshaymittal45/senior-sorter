@@ -45,6 +45,7 @@ class ProcessingConfig:
     face_distance_threshold: float
     relaxed_face_distance_threshold: float
     min_relaxed_hits: int
+    min_strict_hits: int
     blur_tolerance: int
     process_extensions: List[str]
     workers: int
@@ -53,6 +54,20 @@ class ProcessingConfig:
     sample_encoding_jitters: int
     candidate_encoding_jitters: int
     face_detector_model: str
+    face_upsample_times: int
+    enable_detector_fallback: bool
+    mean_topk_margin: float
+    center_distance_margin: float
+    strong_match_distance: float
+    min_candidate_face_area_ratio: float
+    sample_outlier_percentile: float
+    min_sample_encodings: int
+    # --- new robustness fields ---
+    sample_detector_model: str = "cnn"          # CNN for better sample accuracy
+    enable_tiling: bool = True                   # tile large images to find small faces
+    tile_size: int = 800                         # px per tile side
+    tile_overlap: float = 0.25                   # fractional overlap between tiles
+    rotation_angles: str = "-15,15,-30,30"       # comma-sep angles for augment
 
 
 def load_config(config_path: Path) -> Dict:
@@ -74,7 +89,7 @@ def get_drive_service(credentials_json: str, token_json: str):
             creds.refresh(Request())
         else:
             flow = InstalledAppFlow.from_client_secrets_file(credentials_json, SCOPES)
-            creds = flow.run_local_server(port=0)
+            creds = flow.run_local_server(port=53682, authorization_prompt_message="Login to Google", success_message="Login complete. You may close this window.")
         with open(token_json, "w", encoding="utf-8") as token:
             token.write(creds.to_json())
 
@@ -119,7 +134,7 @@ def get_file_metadata(service, file_id: str) -> Optional[Dict]:
             service.files()
             .get(
                 fileId=file_id,
-                fields="id,name,mimeType,parents,shortcutDetails",
+                fields="id,name,mimeType,parents,shortcutDetails,webViewLink",
                 supportsAllDrives=True,
             )
             .execute()
@@ -155,7 +170,7 @@ def list_folder_images(service, folder_id: str, extensions: List[str]) -> List[D
                 service.files()
                 .list(
                     q=f"'{current}' in parents and trashed=false",
-                    fields="nextPageToken, files(id,name,mimeType,shortcutDetails)",
+                    fields="nextPageToken, files(id,name,mimeType,shortcutDetails,webViewLink)",
                     supportsAllDrives=True,
                     includeItemsFromAllDrives=True,
                     corpora="allDrives",
@@ -291,7 +306,16 @@ def variance_of_laplacian(img: np.ndarray) -> float:
     return cv2.Laplacian(gray, cv2.CV_64F).var()
 
 
-def preprocess_variants(img_bgr: np.ndarray, blur_tolerance: int) -> List[np.ndarray]:
+def _parse_rotation_angles(val) -> List[float]:
+    """Parse a comma-separated string or list of rotation angles."""
+    if not val:
+        return []
+    if isinstance(val, (list, tuple)):
+        return [float(v) for v in val if v != 0]
+    return [float(v.strip()) for v in str(val).split(",") if v.strip() and float(v.strip()) != 0]
+
+
+def preprocess_variants(img_bgr: np.ndarray, blur_tolerance: int, rotation_angles=None) -> List[np.ndarray]:
     variants = [img_bgr]
 
     blur_score = variance_of_laplacian(img_bgr)
@@ -311,19 +335,114 @@ def preprocess_variants(img_bgr: np.ndarray, blur_tolerance: int) -> List[np.nda
     flipped = cv2.flip(img_bgr, 1)
     variants.append(flipped)
 
+    # Rotation augmentation — detects faces at angles (tilted / profile-like).
+    angles = _parse_rotation_angles(rotation_angles) if rotation_angles is not None else [-15, 15, -30, 30]
+    h, w = img_bgr.shape[:2]
+    center = (w // 2, h // 2)
+    for angle in angles:
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        rotated = cv2.warpAffine(img_bgr, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
+        variants.append(rotated)
+        # also flip the rotated variant to double coverage
+        variants.append(cv2.flip(rotated, 1))
+
     return variants
+
+
+def tile_image(img_bgr: np.ndarray, tile_size: int, overlap: float) -> List[np.ndarray]:
+    """Split a large image into overlapping tiles for detecting small faces."""
+    h, w = img_bgr.shape[:2]
+    # Only worth tiling if the image is substantially larger than one tile.
+    if max(h, w) < tile_size * 1.4:
+        return []
+    stride = max(1, int(tile_size * (1.0 - overlap)))
+    tiles = []
+    y = 0
+    while y < h:
+        x = 0
+        while x < w:
+            y2 = min(y + tile_size, h)
+            x2 = min(x + tile_size, w)
+            tile = img_bgr[y:y2, x:x2]
+            tiles.append(tile)
+            if x2 == w:
+                break
+            x += stride
+        if y2 == h:
+            break
+        y += stride
+    return tiles
 
 
 def extract_face_encodings(
     img_bgr: np.ndarray,
     detector_model: str = "hog",
     num_jitters: int = 1,
+    upsample_times: int = 1,
+    enable_detector_fallback: bool = True,
+    min_face_area_ratio: float = 0.0,
+    enable_tiling: bool = False,
+    tile_size: int = 800,
+    tile_overlap: float = 0.25,
 ) -> List[np.ndarray]:
     rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    locations = face_recognition.face_locations(rgb, model=detector_model)
-    if not locations:
-        return []
-    return face_recognition.face_encodings(rgb, known_face_locations=locations, num_jitters=num_jitters)
+    detector_order = [detector_model]
+    if enable_detector_fallback:
+        detector_order.extend([m for m in ("hog", "cnn") if m != detector_model])
+
+    upsample_attempts = [max(0, int(upsample_times))]
+    if upsample_attempts[0] < 2:
+        upsample_attempts.append(upsample_attempts[0] + 1)
+
+    def _detect_in_rgb(rgb_img):
+        h, w = rgb_img.shape[:2]
+        locs = []
+        for model_name in detector_order:
+            for upsample in upsample_attempts:
+                try:
+                    locs = face_recognition.face_locations(
+                        rgb_img,
+                        number_of_times_to_upsample=upsample,
+                        model=model_name,
+                    )
+                except Exception:
+                    locs = []
+                if locs:
+                    break
+            if locs:
+                break
+        if not locs:
+            return []
+        filtered = []
+        for top, right, bottom, left in locs:
+            area = max(0, bottom - top) * max(0, right - left)
+            ratio = area / float(max(1, h * w))
+            if ratio >= min_face_area_ratio:
+                filtered.append((top, right, bottom, left))
+        if not filtered:
+            return []
+        return face_recognition.face_encodings(rgb_img, known_face_locations=filtered, num_jitters=num_jitters)
+
+    encodings = _detect_in_rgb(rgb)
+
+    # If no faces found on the full image, try overlapping tiles (helps with
+    # distant faces in large group photos).
+    if not encodings and enable_tiling:
+        tiles = tile_image(img_bgr, tile_size, tile_overlap)
+        seen_encs: List[np.ndarray] = []
+        for tile in tiles:
+            tile_rgb = cv2.cvtColor(tile, cv2.COLOR_BGR2RGB)
+            tile_encs = _detect_in_rgb(tile_rgb)
+            for enc in tile_encs:
+                # Deduplicate: skip if very similar to an already-collected encoding.
+                if seen_encs:
+                    dists = face_recognition.face_distance(seen_encs, enc)
+                    if float(np.min(dists)) < 0.35:
+                        continue
+                seen_encs.append(enc)
+        encodings = seen_encs
+
+    return list(encodings)
 
 
 def compute_partial_face_score(known_encodings: List[np.ndarray], candidate_encoding: np.ndarray) -> float:
@@ -337,66 +456,172 @@ def compute_partial_face_score(known_encodings: List[np.ndarray], candidate_enco
     return score
 
 
+def prune_sample_outliers(
+    encodings: List[np.ndarray],
+    outlier_percentile: float,
+    min_sample_encodings: int,
+) -> List[np.ndarray]:
+    if len(encodings) <= max(min_sample_encodings, 3):
+        return encodings
+
+    mat = np.vstack(encodings)
+    center = np.mean(mat, axis=0)
+    d = np.linalg.norm(mat - center, axis=1)
+    cutoff = float(np.percentile(d, outlier_percentile))
+    kept = [enc for enc, dist in zip(encodings, d) if float(dist) <= cutoff]
+
+    if len(kept) < min_sample_encodings:
+        order = np.argsort(d)
+        top_idx = order[:min_sample_encodings]
+        kept = [encodings[int(i)] for i in top_idx]
+
+    return kept
+
+
 def is_match(
     known_encodings: List[np.ndarray],
     img_bgr: np.ndarray,
     threshold: float,
     relaxed_threshold: float,
+    min_strict_hits: int,
     min_relaxed_hits: int,
     min_partial_face_score: float,
     enable_partial_face_mode: bool,
     blur_tolerance: int,
     candidate_encoding_jitters: int,
     detector_model: str,
+    face_upsample_times: int,
+    enable_detector_fallback: bool,
+    mean_topk_margin: float,
+    center_distance_margin: float,
+    strong_match_distance: float,
+    min_candidate_face_area_ratio: float,
+    rotation_angles=None,
+    enable_tiling: bool = True,
+    tile_size: int = 800,
+    tile_overlap: float = 0.25,
 ) -> Tuple[bool, float]:
+    """Tiered face matching — fast path first, expensive augmentations only if needed."""
+    known_center = np.mean(np.vstack(known_encodings), axis=0)
+    sample_center_distances = np.linalg.norm(np.vstack(known_encodings) - known_center, axis=1)
+    dynamic_center_limit = float(np.percentile(sample_center_distances, 90)) + center_distance_margin
+    dynamic_center_limit = max(dynamic_center_limit, threshold + center_distance_margin)
+
     best_distance = 999.0
     best_partial_score = 0.0
+    best_center_distance = 999.0
     strict_hits = 0
     relaxed_hits = 0
-    known_center = np.mean(np.vstack(known_encodings), axis=0)
-    center_margin = 0.01
 
-    for variant in preprocess_variants(img_bgr, blur_tolerance):
-        candidate_encodings = extract_face_encodings(
+    def _extract(variant, use_tiling=False):
+        return extract_face_encodings(
             variant,
             detector_model=detector_model,
             num_jitters=candidate_encoding_jitters,
+            upsample_times=face_upsample_times,
+            enable_detector_fallback=enable_detector_fallback,
+            min_face_area_ratio=min_candidate_face_area_ratio,
+            enable_tiling=use_tiling,
+            tile_size=tile_size,
+            tile_overlap=tile_overlap,
         )
+
+    def _score_variant(variant, use_tiling=False):
+        nonlocal best_distance, best_partial_score, best_center_distance
+        nonlocal strict_hits, relaxed_hits
+        candidate_encodings = _extract(variant, use_tiling)
+        variant_strict = False
+        variant_relaxed = False
         for candidate in candidate_encodings:
             distances = face_recognition.face_distance(known_encodings, candidate)
             if len(distances) == 0:
                 continue
-
             d = float(np.min(distances))
+            k = min(3, len(distances))
+            mean_topk = float(np.mean(np.partition(distances, k - 1)[:k]))
             center_d = float(np.linalg.norm(candidate - known_center))
             if d < best_distance:
                 best_distance = d
-
-            if d <= threshold and center_d <= (threshold + center_margin):
-                strict_hits += 1
-                if strict_hits >= 1:
-                    return True, min(d, center_d)
-
-            if d <= relaxed_threshold and center_d <= (relaxed_threshold + center_margin):
-                relaxed_hits += 1
-                if relaxed_hits >= min_relaxed_hits and best_distance <= relaxed_threshold:
-                    return True, min(d, center_d)
-
+            if center_d < best_center_distance:
+                best_center_distance = center_d
+            # STRONG MATCH — return immediately, skip everything else.
+            if d <= strong_match_distance and center_d <= (dynamic_center_limit + center_distance_margin):
+                return True, d
+            if d <= threshold and mean_topk <= (threshold + mean_topk_margin) and center_d <= dynamic_center_limit:
+                variant_strict = True
+            if d <= relaxed_threshold and mean_topk <= (relaxed_threshold + mean_topk_margin) and center_d <= (dynamic_center_limit + center_distance_margin):
+                variant_relaxed = True
             if enable_partial_face_mode:
-                partial_score = compute_partial_face_score(known_encodings, candidate)
-                best_partial_score = max(best_partial_score, partial_score)
+                ps = compute_partial_face_score(known_encodings, candidate)
+                best_partial_score = max(best_partial_score, ps)
 
+        if variant_strict:
+            strict_hits += 1
+            if strict_hits >= min_strict_hits:
+                return True, min(best_distance, best_center_distance)
+        if variant_relaxed:
+            relaxed_hits += 1
+            if relaxed_hits >= min_relaxed_hits and best_distance <= relaxed_threshold:
+                return True, min(best_distance, best_center_distance)
+        return None, None  # not decided yet
+
+    # ── TIER 1: original image only (fastest — catches ~80% of clear matches) ──
+    result, score = _score_variant(img_bgr)
+    if result is not None:
+        return result, score
+
+    # ── TIER 2: CLAHE enhanced + horizontal flip (catches bad lighting / mirrors) ──
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    l_ch, a_ch, b_ch = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l2 = clahe.apply(l_ch)
+    enhanced = cv2.cvtColor(cv2.merge((l2, a_ch, b_ch)), cv2.COLOR_LAB2BGR)
+    for variant in [enhanced, cv2.flip(img_bgr, 1)]:
+        result, score = _score_variant(variant)
+        if result is not None:
+            return result, score
+
+    # ── TIER 3: rotations + sharpening (catches angled / blurry faces) ──
+    # Only run if tiers 1-2 found SOME faces but no match,
+    # or found no faces and we should try harder.
+    tier3_variants = []
+    blur_score = variance_of_laplacian(img_bgr)
+    if blur_score < blur_tolerance:
+        kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
+        tier3_variants.append(cv2.filter2D(img_bgr, -1, kernel))
+
+    angles = _parse_rotation_angles(rotation_angles)
+    if angles:
+        h, w = img_bgr.shape[:2]
+        center_pt = (w // 2, h // 2)
+        for angle in angles:
+            M = cv2.getRotationMatrix2D(center_pt, angle, 1.0)
+            rotated = cv2.warpAffine(img_bgr, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
+            tier3_variants.append(rotated)
+
+    for variant in tier3_variants:
+        result, score = _score_variant(variant)
+        if result is not None:
+            return result, score
+
+    # ── TIER 4: tiling (catches tiny faces in large group photos) ──
+    if enable_tiling and best_distance > relaxed_threshold:
+        result, score = _score_variant(img_bgr, use_tiling=True)
+        if result is not None:
+            return result, score
+
+    # ── Final partial-face check ──
     if (
         enable_partial_face_mode
         and best_partial_score >= min_partial_face_score
         and best_distance <= relaxed_threshold
+        and best_center_distance <= (dynamic_center_limit + center_distance_margin)
         and relaxed_hits >= 1
     ):
         return True, 1.0 - best_partial_score
 
     if best_distance == 999.0:
         return False, 1.0
-
     return False, best_distance
 
 
@@ -406,8 +631,17 @@ def prepare_known_encodings(
     blur_tolerance: int,
     sample_encoding_jitters: int,
     detector_model: str,
+    face_upsample_times: int,
+    enable_detector_fallback: bool,
+    sample_outlier_percentile: float,
+    min_sample_encodings: int,
+    sample_detector_model: str = "hog",
+    rotation_angles=None,
 ) -> List[np.ndarray]:
     encodings = []
+    # HOG is fast; CNN fallback catches anything HOG misses.
+    # Always enable fallback so CNN kicks in when HOG fails on sample images.
+    effective_detector = sample_detector_model if sample_detector_model else detector_model
     for img_path in samples_dir.glob("**/*"):
         if not img_path.is_file():
             continue
@@ -427,15 +661,32 @@ def prepare_known_encodings(
             continue
 
         img = resize_if_needed(img, max_side)
-        for variant in preprocess_variants(img, blur_tolerance):
+
+        # For sample images: use a light set of variants (original + CLAHE enhanced
+        # + horizontal flip). Skip rotations — reference photos should be
+        # clear and frontal; extra rotations just slow things down.
+        sample_variants = [img]
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l_ch, a_ch, b_ch = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l2 = clahe.apply(l_ch)
+        enhanced = cv2.cvtColor(cv2.merge((l2, a_ch, b_ch)), cv2.COLOR_LAB2BGR)
+        sample_variants.append(enhanced)
+        sample_variants.append(cv2.flip(img, 1))
+
+        for variant in sample_variants:
             sample_encodings = extract_face_encodings(
                 variant,
-                detector_model=detector_model,
+                detector_model=effective_detector,
                 num_jitters=sample_encoding_jitters,
+                upsample_times=face_upsample_times,
+                enable_detector_fallback=True,  # always fall back to CNN for samples
+                min_face_area_ratio=0.0,
+                enable_tiling=False,
             )
             encodings.extend(sample_encodings)
 
-    return encodings
+    return prune_sample_outliers(encodings, sample_outlier_percentile, min_sample_encodings)
 
 
 def sanitize_filename(value: str) -> str:
@@ -466,17 +717,30 @@ def process_single_candidate(
 
     img = resize_if_needed(img, pconfig.max_image_side)
 
+    rotation_angles = _parse_rotation_angles(pconfig.rotation_angles)
+
     matched, score = is_match(
         known_encodings,
         img,
         pconfig.face_distance_threshold,
         pconfig.relaxed_face_distance_threshold,
+        pconfig.min_strict_hits,
         pconfig.min_relaxed_hits,
         pconfig.min_partial_face_score,
         pconfig.enable_partial_face_mode,
         pconfig.blur_tolerance,
         pconfig.candidate_encoding_jitters,
         pconfig.face_detector_model,
+        pconfig.face_upsample_times,
+        pconfig.enable_detector_fallback,
+        pconfig.mean_topk_margin,
+        pconfig.center_distance_margin,
+        pconfig.strong_match_distance,
+        pconfig.min_candidate_face_area_ratio,
+        rotation_angles=rotation_angles,
+        enable_tiling=pconfig.enable_tiling,
+        tile_size=pconfig.tile_size,
+        tile_overlap=pconfig.tile_overlap,
     )
 
     ext = Path(file_name).suffix.lower()
@@ -490,6 +754,10 @@ def process_single_candidate(
         save_match_image(img, matches_dir / out_name)
     elif save_non_matches:
         save_match_image(img, non_matches_dir / out_name)
+
+    # Explicitly free image memory — critical on long runs to prevent OOM
+    del img
+    import gc; gc.collect()
 
     return matched, file_name, score
 
@@ -519,6 +787,7 @@ def main() -> None:
         max_image_side=int(config["processing"]["max_image_side"]),
         face_distance_threshold=float(config["processing"]["face_distance_threshold"]),
         relaxed_face_distance_threshold=float(config["processing"].get("relaxed_face_distance_threshold", 0.58)),
+        min_strict_hits=int(config["processing"].get("min_strict_hits", 2)),
         min_relaxed_hits=int(config["processing"].get("min_relaxed_hits", 2)),
         blur_tolerance=int(config["processing"]["blur_tolerance"]),
         process_extensions=list(config["processing"]["process_extensions"]),
@@ -528,6 +797,14 @@ def main() -> None:
         sample_encoding_jitters=int(config["processing"].get("sample_encoding_jitters", 2)),
         candidate_encoding_jitters=int(config["processing"].get("candidate_encoding_jitters", 1)),
         face_detector_model=str(config["processing"].get("face_detector_model", "hog")),
+        face_upsample_times=int(config["processing"].get("face_upsample_times", 1)),
+        enable_detector_fallback=bool(config["processing"].get("enable_detector_fallback", True)),
+        mean_topk_margin=float(config["processing"].get("mean_topk_margin", 0.015)),
+        center_distance_margin=float(config["processing"].get("center_distance_margin", 0.02)),
+        strong_match_distance=float(config["processing"].get("strong_match_distance", 0.42)),
+        min_candidate_face_area_ratio=float(config["processing"].get("min_candidate_face_area_ratio", 0.01)),
+        sample_outlier_percentile=float(config["processing"].get("sample_outlier_percentile", 85.0)),
+        min_sample_encodings=int(config["processing"].get("min_sample_encodings", 4)),
     )
 
     if not links_file.exists():
@@ -549,6 +826,10 @@ def main() -> None:
         pconfig.blur_tolerance,
         pconfig.sample_encoding_jitters,
         pconfig.face_detector_model,
+        pconfig.face_upsample_times,
+        pconfig.enable_detector_fallback,
+        pconfig.sample_outlier_percentile,
+        pconfig.min_sample_encodings,
     )
     if not known_encodings:
         print("No faces found in samples. Add clearer sample images and rerun.")
