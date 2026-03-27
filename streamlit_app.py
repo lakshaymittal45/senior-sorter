@@ -135,14 +135,18 @@ def get_user_info(creds: Credentials) -> Dict:
 
 def has_oauth_client_config(root: Path, config: Dict) -> bool:
     credentials_json = root / config.get("oauth", {}).get("credentials_json", "client_secret.json")
-    return credentials_json.exists()
+    if credentials_json.exists():
+        return True
+    return "GOOGLE_CLIENT_SECRET" in os.environ
 
 
 def get_oauth_client_config(root: Path, config: Dict) -> Dict:
     credentials_json = root / config.get("oauth", {}).get("credentials_json", "client_secret.json")
     if credentials_json.exists():
         return json.loads(credentials_json.read_text(encoding="utf-8"))
-    raise FileNotFoundError("OAuth client JSON not found.")
+    if "GOOGLE_CLIENT_SECRET" in os.environ:
+        return json.loads(os.environ["GOOGLE_CLIENT_SECRET"])
+    raise FileNotFoundError("OAuth client JSON not found in file or GOOGLE_CLIENT_SECRET env var.")
 
 
 def get_oauth_redirect_uri(config: Dict) -> str:
