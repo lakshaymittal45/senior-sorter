@@ -442,7 +442,7 @@ def run_extraction(root: Path, config: Dict, links_text: str, uploaded_samples) 
     doubtful_count = 0
     processed_count = 0
     workers = max(1, pconfig.workers)
-    per_image_timeout = 10  # seconds — save to doubtful if takes longer
+    per_image_timeout = 8  # seconds — save to doubtful if taken longer
 
     import time as _time
     from senior_sorter import download_drive_image, download_drive_file_raw, resize_if_needed, save_match_image, sanitize_filename

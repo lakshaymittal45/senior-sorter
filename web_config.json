@@ -7,7 +7,7 @@
     "local_redirect_uri": "http://localhost:8501/"
   },
   "processing": {
-    "max_image_side": 800,
+    "max_image_side": 1000,
 
     "face_distance_threshold": 0.50,
     "relaxed_face_distance_threshold": 0.58,
@@ -34,12 +34,12 @@
     "tile_size": 800,
     "tile_overlap": 0.25,
 
-    "rotation_angles": "",
+    "rotation_angles": "-15,15",
 
     "enable_partial_face_mode": true,
     "min_partial_face_score": 0.40,
 
-    "workers": 1,
+    "workers": 2,
 
     "process_extensions": ["jpg", "jpeg", "png", "webp", "heic", "heif", "nef"],
     "save_non_matches": false
