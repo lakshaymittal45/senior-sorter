@@ -150,6 +150,8 @@ def get_oauth_client_config(root: Path, config: Dict) -> Dict:
 
 
 def get_oauth_redirect_uri(config: Dict) -> str:
+    if "SPACE_HOST" in os.environ:
+        return f"https://{os.environ['SPACE_HOST']}/"
     oauth_cfg = config.get("oauth", {})
     return oauth_cfg.get("redirect_uri") or oauth_cfg.get("local_redirect_uri", "http://localhost:8501/")
 
