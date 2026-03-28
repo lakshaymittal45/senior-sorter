@@ -237,6 +237,41 @@ def gather_candidate_images(service, links: List[str], extensions: List[str]) ->
     return all_candidates
 
 
+def _pil_decode_worker(raw_bytes, result_path):
+    """Runs in a separate process so it can be force-killed if PIL/HEIC hangs."""
+    try:
+        with Image.open(io.BytesIO(raw_bytes)) as pil_img:
+            rgb = np.array(pil_img.convert("RGB"))
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            np.save(result_path, bgr)
+    except Exception:
+        pass
+
+
+def _pil_decode_with_timeout(raw: bytes, timeout: int = 6) -> Optional[np.ndarray]:
+    """Decode via PIL in a child process with a hard kill timeout."""
+    import multiprocessing, tempfile
+    result_path = Path(tempfile.mktemp(suffix=".npy"))
+    proc = multiprocessing.Process(target=_pil_decode_worker, args=(raw, str(result_path)))
+    proc.start()
+    proc.join(timeout=timeout)
+    if proc.is_alive():
+        proc.kill()
+        proc.join(timeout=2)
+    if result_path.exists():
+        try:
+            arr = np.load(str(result_path))
+            return arr
+        except Exception:
+            return None
+        finally:
+            try:
+                result_path.unlink()
+            except Exception:
+                pass
+    return None
+
+
 def decode_image_bytes(raw: bytes) -> Optional[np.ndarray]:
     data = np.frombuffer(raw, dtype=np.uint8)
     img_bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
@@ -244,12 +279,10 @@ def decode_image_bytes(raw: bytes) -> Optional[np.ndarray]:
         return img_bgr
 
     # Fallback path for formats OpenCV may not decode (for example HEIC/HEIF).
-    try:
-        with Image.open(io.BytesIO(raw)) as pil_img:
-            rgb = np.array(pil_img.convert("RGB"))
-            return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    except Exception:
-        pass
+    # Runs in isolated subprocess so a hung C++ HEIC decoder can be force-killed.
+    result = _pil_decode_with_timeout(raw, timeout=6)
+    if result is not None:
+        return result
 
     # RAW fallback path (for example .NEF) if rawpy is available.
     if rawpy is not None:
@@ -716,53 +749,62 @@ def process_single_candidate(
     file_id = file_meta["id"]
     file_name = file_meta.get("name", file_id)
 
-    img = download_drive_image(service, file_id)
-    if img is None:
+    try:
+        img = download_drive_image(service, file_id)
+        if img is None:
+            return False, file_name, 1.0
+
+        img = resize_if_needed(img, pconfig.max_image_side)
+
+        rotation_angles = _parse_rotation_angles(pconfig.rotation_angles)
+
+        matched, score = is_match(
+            known_encodings,
+            img,
+            pconfig.face_distance_threshold,
+            pconfig.relaxed_face_distance_threshold,
+            pconfig.min_strict_hits,
+            pconfig.min_relaxed_hits,
+            pconfig.min_partial_face_score,
+            pconfig.enable_partial_face_mode,
+            pconfig.blur_tolerance,
+            pconfig.candidate_encoding_jitters,
+            pconfig.face_detector_model,
+            pconfig.face_upsample_times,
+            pconfig.enable_detector_fallback,
+            pconfig.mean_topk_margin,
+            pconfig.center_distance_margin,
+            pconfig.strong_match_distance,
+            pconfig.min_candidate_face_area_ratio,
+            rotation_angles=rotation_angles,
+            enable_tiling=pconfig.enable_tiling,
+            tile_size=pconfig.tile_size,
+            tile_overlap=pconfig.tile_overlap,
+        )
+
+        ext = Path(file_name).suffix.lower()
+        if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+            ext = ".jpg"
+
+        safe_name = sanitize_filename(Path(file_name).stem)
+        out_name = f"{safe_name}__{file_id}{ext}"
+
+        if matched:
+            save_match_image(img, matches_dir / out_name)
+        elif save_non_matches:
+            save_match_image(img, non_matches_dir / out_name)
+
+    except Exception:
+        # Catch absolutely any error (MemoryError, segfault-adjacent, etc.)
+        # so a single bad image never kills the entire run.
         return False, file_name, 1.0
-
-    img = resize_if_needed(img, pconfig.max_image_side)
-
-    rotation_angles = _parse_rotation_angles(pconfig.rotation_angles)
-
-    matched, score = is_match(
-        known_encodings,
-        img,
-        pconfig.face_distance_threshold,
-        pconfig.relaxed_face_distance_threshold,
-        pconfig.min_strict_hits,
-        pconfig.min_relaxed_hits,
-        pconfig.min_partial_face_score,
-        pconfig.enable_partial_face_mode,
-        pconfig.blur_tolerance,
-        pconfig.candidate_encoding_jitters,
-        pconfig.face_detector_model,
-        pconfig.face_upsample_times,
-        pconfig.enable_detector_fallback,
-        pconfig.mean_topk_margin,
-        pconfig.center_distance_margin,
-        pconfig.strong_match_distance,
-        pconfig.min_candidate_face_area_ratio,
-        rotation_angles=rotation_angles,
-        enable_tiling=pconfig.enable_tiling,
-        tile_size=pconfig.tile_size,
-        tile_overlap=pconfig.tile_overlap,
-    )
-
-    ext = Path(file_name).suffix.lower()
-    if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
-        ext = ".jpg"
-
-    safe_name = sanitize_filename(Path(file_name).stem)
-    out_name = f"{safe_name}__{file_id}{ext}"
-
-    if matched:
-        save_match_image(img, matches_dir / out_name)
-    elif save_non_matches:
-        save_match_image(img, non_matches_dir / out_name)
-
-    # Explicitly free image memory — critical on long runs to prevent OOM
-    del img
-    import gc; gc.collect()
+    finally:
+        # Explicitly free image memory — critical on long runs to prevent OOM
+        try:
+            del img
+        except NameError:
+            pass
+        import gc; gc.collect()
 
     return matched, file_name, score
 
