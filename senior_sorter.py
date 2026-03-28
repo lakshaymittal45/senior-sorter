@@ -240,6 +240,7 @@ def gather_candidate_images(service, links: List[str], extensions: List[str]) ->
 def _pil_decode_worker(raw_bytes, result_path):
     """Runs in a separate process so it can be force-killed if PIL/HEIC hangs."""
     try:
+        pillow_heif.register_heif_opener()
         with Image.open(io.BytesIO(raw_bytes)) as pil_img:
             rgb = np.array(pil_img.convert("RGB"))
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
@@ -249,26 +250,59 @@ def _pil_decode_worker(raw_bytes, result_path):
 
 
 def _pil_decode_with_timeout(raw: bytes, timeout: int = 6) -> Optional[np.ndarray]:
-    """Decode via PIL in a child process with a hard kill timeout."""
-    import multiprocessing, tempfile
-    result_path = Path(tempfile.mktemp(suffix=".npy"))
-    proc = multiprocessing.Process(target=_pil_decode_worker, args=(raw, str(result_path)))
-    proc.start()
-    proc.join(timeout=timeout)
-    if proc.is_alive():
-        proc.kill()
-        proc.join(timeout=2)
-    if result_path.exists():
+    """Decode via PIL with a hard kill timeout.
+    On Linux (HF Spaces): uses signal.alarm for zero-overhead timeout.
+    On Windows: uses multiprocessing subprocess as fallback.
+    """
+    import sys
+
+    # ── Linux path: signal-based timeout (fast, no subprocess overhead) ──
+    if sys.platform != "win32":
+        import signal
+
+        class _HeicTimeout(Exception):
+            pass
+
+        def _alarm_handler(signum, frame):
+            raise _HeicTimeout()
+
+        old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+        signal.alarm(timeout)
         try:
-            arr = np.load(str(result_path))
-            return arr
+            with Image.open(io.BytesIO(raw)) as pil_img:
+                rgb = np.array(pil_img.convert("RGB"))
+                return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        except _HeicTimeout:
+            return None
         except Exception:
             return None
         finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+
+    # ── Windows path: subprocess-based timeout ──
+    import multiprocessing, tempfile
+    result_path = Path(tempfile.mktemp(suffix=".npy"))
+    try:
+        proc = multiprocessing.Process(target=_pil_decode_worker, args=(raw, str(result_path)))
+        proc.start()
+        proc.join(timeout=timeout)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=2)
+        if result_path.exists():
             try:
-                result_path.unlink()
+                arr = np.load(str(result_path))
+                return arr
             except Exception:
-                pass
+                return None
+    except Exception:
+        return None
+    finally:
+        try:
+            result_path.unlink(missing_ok=True)
+        except Exception:
+            pass
     return None
 
 
@@ -279,7 +313,7 @@ def decode_image_bytes(raw: bytes) -> Optional[np.ndarray]:
         return img_bgr
 
     # Fallback path for formats OpenCV may not decode (for example HEIC/HEIF).
-    # Runs in isolated subprocess so a hung C++ HEIC decoder can be force-killed.
+    # Uses a hard timeout so a hung C++ HEIC decoder cannot freeze the app.
     result = _pil_decode_with_timeout(raw, timeout=6)
     if result is not None:
         return result

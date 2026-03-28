@@ -513,74 +513,45 @@ def run_extraction(root: Path, config: Dict, links_text: str, uploaded_samples) 
         except Exception:
             pass
 
-    if workers <= 1:
-        for meta in candidates:
-            processed_count += 1
-            file_name = meta.get("name", meta.get("id", "unknown"))
-            src_link = meta.get("webViewLink", meta.get("source_link", "unknown"))
-            status.markdown(f"**Processing {processed_count}/{total}:** `{file_name}`  \n🔗 **Source File:** [{src_link}]({src_link})")
-            t0 = _time.time()
+    for meta in candidates:
+        processed_count += 1
+        file_name = meta.get("name", meta.get("id", "unknown"))
+        src_link = meta.get("webViewLink", meta.get("source_link", "unknown"))
+        status.markdown(f"**Processing {processed_count}/{total}:** `{file_name}`  \n🔗 **Source File:** [{src_link}]({src_link})")
+        t0 = _time.time()
 
-            ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            future = ex.submit(_process_one, meta)
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = ex.submit(_process_one, meta)
+        try:
+            ok, _, _ = future.result(timeout=per_image_timeout)
+            ex.shutdown(wait=True)
+        except concurrent.futures.TimeoutError:
+            ok = False
+            doubtful_count += 1
+            detail.warning(f"⏭️ Doubtful (slow): {file_name} → saved for review")
+            _save_doubtful(meta)
             try:
-                ok, _, _ = future.result(timeout=per_image_timeout)
-                ex.shutdown(wait=True)
-            except concurrent.futures.TimeoutError:
-                ok = False
-                doubtful_count += 1
-                detail.warning(f"⏭️ Doubtful (slow): {file_name} → saved for review")
-                _save_doubtful(meta)
-                try:
-                    ex.shutdown(wait=False, cancel_futures=True)
-                except TypeError:
-                    ex.shutdown(wait=False)  # Fallback for Python < 3.9
-            except Exception:
-                ok = False
-                try:
-                    ex.shutdown(wait=False, cancel_futures=True)
-                except TypeError:
-                    ex.shutdown(wait=False)
+                ex.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                ex.shutdown(wait=False)  # Fallback for Python < 3.9
+        except Exception:
+            ok = False
+            try:
+                ex.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                ex.shutdown(wait=False)
 
-            elapsed = _time.time() - t0
-            src = meta.get("source_link", "unknown")
-            link_stats[src]["processed"] += 1
-            if ok:
-                matched += 1
-                link_stats[src]["matched"] += 1
-            progress.progress(processed_count / total)
-            status.markdown(
-                f"**Processed {processed_count}/{total}** ({elapsed:.1f}s) | "
-                f"**Matched {matched}**" + (f" | **Doubtful {doubtful_count}**" if doubtful_count else "")
-            )
-    else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            future_to_meta = {
-                executor.submit(_process_one, meta): meta
-                for meta in candidates
-            }
-            for future in concurrent.futures.as_completed(future_to_meta):
-                meta = future_to_meta[future]
-                processed_count += 1
-                file_name = meta.get("name", meta.get("id", "unknown"))
-                try:
-                    ok, _, _ = future.result(timeout=per_image_timeout)
-                except concurrent.futures.TimeoutError:
-                    ok = False
-                    doubtful_count += 1
-                    _save_doubtful(meta)
-                except Exception:
-                    ok = False
-                src = meta.get("source_link", "unknown")
-                link_stats[src]["processed"] += 1
-                if ok:
-                    matched += 1
-                    link_stats[src]["matched"] += 1
-                progress.progress(processed_count / total)
-                status.text(
-                    f"Processed {processed_count}/{total}: {file_name} | "
-                    f"Matched {matched}" + (f" | Doubtful {doubtful_count}" if doubtful_count else "")
-                )
+        elapsed = _time.time() - t0
+        src = meta.get("source_link", "unknown")
+        link_stats[src]["processed"] += 1
+        if ok:
+            matched += 1
+            link_stats[src]["matched"] += 1
+        progress.progress(processed_count / total)
+        status.markdown(
+            f"**Processed {processed_count}/{total}** ({elapsed:.1f}s) | "
+            f"**Matched {matched}**" + (f" | **Doubtful {doubtful_count}**" if doubtful_count else "")
+        )
 
     zip_path = work_dir / "senior_matches.zip"
     count_in_zip, doubtful_in_zip = zip_matches(matches_dir, doubtful_dir, zip_path)
