@@ -34,3 +34,7 @@ token_web.json
 # OS files
 .DS_Store
 Thumbs.db
+
+# Ignored config and backups
+config.json
+deploy_backup/
