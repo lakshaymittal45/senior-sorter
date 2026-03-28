@@ -388,15 +388,44 @@ def run_extraction(root: Path, config: Dict, links_text: str, uploaded_samples) 
         except (PermissionError, OSError):
             pass  # file still locked by previous thread on Windows
 
-    for old in samples_dir.glob("*"):
-        if old.is_file():
-            _safe_unlink(old)
-    for old in matches_dir.glob("*"):
-        if old.is_file():
-            _safe_unlink(old)
-    for old in doubtful_dir.glob("*"):
-        if old.is_file():
-            _safe_unlink(old)
+    def _extract_file_ids_from_dir(d: Path) -> set:
+        """Extract Drive file IDs from previously saved files (pattern: name__fileId.ext)."""
+        ids = set()
+        for f in d.glob("*"):
+            if f.is_file() and "__" in f.stem:
+                ids.add(f.stem.split("__", 1)[1])
+        return ids
+
+    # Detect previous partial results for resume capability
+    prev_match_ids = _extract_file_ids_from_dir(matches_dir)
+    prev_doubtful_ids = _extract_file_ids_from_dir(doubtful_dir)
+    already_done_ids = prev_match_ids | prev_doubtful_ids
+
+    is_resuming = False
+    if already_done_ids:
+        st.info(f"🔄 Found **{len(prev_match_ids)}** matched and **{len(prev_doubtful_ids)}** doubtful images from a previous run.")
+        resume_mode = st.radio(
+            "Previous results found. What would you like to do?",
+            ["▶️ Resume — skip already processed images", "🔄 Fresh Start — redo everything"],
+            index=0,
+            key="resume_mode_radio",
+        )
+        if resume_mode.startswith("🔄"):
+            # Wipe everything for a fresh start
+            for old in matches_dir.glob("*"):
+                if old.is_file():
+                    _safe_unlink(old)
+            for old in doubtful_dir.glob("*"):
+                if old.is_file():
+                    _safe_unlink(old)
+            already_done_ids = set()
+        else:
+            is_resuming = True
+    else:
+        # No previous results, clean start
+        for old in samples_dir.glob("*"):
+            if old.is_file():
+                _safe_unlink(old)
 
     save_uploaded_samples(uploaded_samples, samples_dir)
 
@@ -424,6 +453,15 @@ def run_extraction(root: Path, config: Dict, links_text: str, uploaded_samples) 
     with st.spinner("Discovering candidate images from Drive links..."):
         candidates = gather_candidate_images(service, links, pconfig.process_extensions)
 
+    total_discovered = len(candidates)
+
+    # Filter out already-processed images if resuming
+    if already_done_ids:
+        candidates = [m for m in candidates if m["id"] not in already_done_ids]
+        skipped = total_discovered - len(candidates)
+        if skipped > 0:
+            st.success(f"⚡ Resuming: skipping {skipped} already-processed images, {len(candidates)} remaining.")
+
     link_stats: Dict[str, Dict[str, int]] = {link: {"candidates": 0, "processed": 0, "matched": 0} for link in links}
     for meta in candidates:
         src = meta.get("source_link", "unknown")
@@ -432,13 +470,17 @@ def run_extraction(root: Path, config: Dict, links_text: str, uploaded_samples) 
         link_stats[src]["candidates"] += 1
 
     total = len(candidates)
-    if total == 0:
+    if total == 0 and not already_done_ids:
         return {"ok": False, "error": "No candidate images found from given links."}
+    if total == 0 and already_done_ids:
+        return {"ok": True, "processed": total_discovered, "matched": len(prev_match_ids),
+                "doubtful": len(prev_doubtful_ids), "zip_path": "", "zip_count": 0, "zip_doubtful": 0,
+                "per_link_stats": [], "resumed": True}
 
     progress = st.progress(0.0)
     status = st.empty()
     detail = st.empty()
-    matched = 0
+    matched = len(prev_match_ids) if is_resuming else 0
     doubtful_count = 0
     processed_count = 0
     workers = max(1, pconfig.workers)
